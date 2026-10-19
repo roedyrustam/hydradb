@@ -20,35 +20,6 @@ pub struct FileTlsReloader {
     task: JoinHandle<()>,
 }
 
-fn load_certificate_material(
-    certificate_path: &Path,
-    private_key_path: &Path,
-) -> TlsResult<(
-    Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>>,
-    tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>,
-    DefaultHasher,
-)> {
-    let certificate_bytes = std::fs::read(certificate_path)?;
-    let private_key_bytes = std::fs::read(private_key_path)?;
-    let mut certificate_reader = Cursor::new(certificate_bytes.as_slice());
-    let certificates = rustls_pemfile::certs(&mut certificate_reader)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    if certificates.is_empty() {
-        return Err(Error::new(ErrorKind::InvalidData, "TLS certificate file is empty").into());
-    }
-    let mut private_key_reader = Cursor::new(private_key_bytes.as_slice());
-    let private_key = rustls_pemfile::private_key(&mut private_key_reader)?.ok_or_else(|| {
-        Error::new(
-            ErrorKind::InvalidData,
-            "TLS private key file contains no key",
-        )
-    })?;
-    let mut fingerprint = DefaultHasher::new();
-    certificate_bytes.hash(&mut fingerprint);
-    private_key_bytes.hash(&mut fingerprint);
-    Ok((certificates, private_key, fingerprint))
-}
-
 impl FileTlsReloader {
     pub fn start(
         certificate_path: &Path,
@@ -112,22 +83,48 @@ impl FileTlsReloader {
 }
 
 fn load_server_config(
-    certificate_path: &PathBuf,
-    private_key_path: &PathBuf,
+    certificate_path: &Path,
+    private_key_path: &Path,
 ) -> TlsResult<(ServerConfig, u64)> {
-    let certificate_bytes = std::fs::read(certificate_path)?;
-    let private_key_bytes = std::fs::read(private_key_path)?;
+    let certificate_bytes = std::fs::read(certificate_path).map_err(|err| {
+        Error::new(
+            err.kind(),
+            format!(
+                "cannot read TLS certificate at {}: {err}",
+                certificate_path.display()
+            ),
+        )
+    })?;
+    let private_key_bytes = std::fs::read(private_key_path).map_err(|err| {
+        Error::new(
+            err.kind(),
+            format!(
+                "cannot read TLS private key at {}: {err}",
+                private_key_path.display()
+            ),
+        )
+    })?;
     let mut certificate_reader = Cursor::new(certificate_bytes.as_slice());
     let certificates = rustls_pemfile::certs(&mut certificate_reader)
         .collect::<std::result::Result<Vec<_>, _>>()?;
     if certificates.is_empty() {
-        return Err(Error::new(ErrorKind::InvalidData, "TLS certificate file is empty").into());
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "TLS certificate file at {} is empty",
+                certificate_path.display()
+            ),
+        )
+        .into());
     }
     let mut private_key_reader = Cursor::new(private_key_bytes.as_slice());
     let private_key = rustls_pemfile::private_key(&mut private_key_reader)?.ok_or_else(|| {
         Error::new(
             ErrorKind::InvalidData,
-            "TLS private key file contains no key",
+            format!(
+                "TLS private key file at {} contains no key",
+                private_key_path.display()
+            ),
         )
     })?;
     let config = ServerConfig::builder()
@@ -151,6 +148,62 @@ mod tests {
         let certificate = params.self_signed(&key).unwrap();
         std::fs::write(certificate_path, certificate.pem()).unwrap();
         std::fs::write(private_key_path, key.serialize_pem()).unwrap();
+    }
+
+    #[test]
+    fn missing_tls_certificate_file_names_the_path_and_keeps_its_kind() {
+        let directory = tempfile::tempdir().unwrap();
+        let cert_path = directory.path().join("missing.crt");
+        let key_path = directory.path().join("tls.key");
+        write_certificate_pair(&directory.path().join("dummy.crt"), &key_path);
+
+        let error = load_server_config(&cert_path, &key_path).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("cannot read TLS certificate"), "{message}");
+        assert!(message.contains(cert_path.to_str().unwrap()), "{message}");
+        assert_eq!(
+            error.downcast_ref::<Error>().map(Error::kind),
+            Some(ErrorKind::NotFound),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn missing_tls_private_key_file_names_the_path_and_keeps_its_kind() {
+        let directory = tempfile::tempdir().unwrap();
+        let cert_path = directory.path().join("tls.crt");
+        let key_path = directory.path().join("missing.key");
+        write_certificate_pair(&cert_path, &directory.path().join("dummy.key"));
+
+        let error = load_server_config(&cert_path, &key_path).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("cannot read TLS private key"), "{message}");
+        assert!(message.contains(key_path.to_str().unwrap()), "{message}");
+        assert_eq!(
+            error.downcast_ref::<Error>().map(Error::kind),
+            Some(ErrorKind::NotFound),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn empty_tls_certificate_file_names_the_path_and_reports_invalid_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let cert_path = directory.path().join("empty.crt");
+        let key_path = directory.path().join("tls.key");
+        std::fs::write(&cert_path, b"").unwrap();
+        write_certificate_pair(&directory.path().join("dummy.crt"), &key_path);
+
+        let error = load_server_config(&cert_path, &key_path).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("TLS certificate file at"), "{message}");
+        assert!(message.contains("is empty"), "{message}");
+        assert!(message.contains(cert_path.to_str().unwrap()), "{message}");
+        assert_eq!(
+            error.downcast_ref::<Error>().map(Error::kind),
+            Some(ErrorKind::InvalidData),
+            "{message}"
+        );
     }
 
     #[tokio::test]
